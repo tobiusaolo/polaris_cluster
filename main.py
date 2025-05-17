@@ -1,29 +1,31 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import List, Dict, Optional
-from utility.utils import load_data_from_db, get_available_nodes, flatten_models, assign_models_to_nodes, find_best_node_for_model, deploy_model,update_high_demand_models
+from typing import List, Dict, Optional,Any
+from utility.utils import load_data_from_db, get_available_nodes, flatten_models, assign_models_to_nodes, find_best_node_for_model, update_high_demand_models
 from db.database import FirestoreDB
+from db.firebase import db
+from deploy_models.deploy import deploy_model,update_node_and_assignment
 from scheduler.scheduler import Scheduler
 import asyncio
 import threading
+import time
+import os
 from models import *
 from collections import defaultdict
 from dateutil import parser
 import logging
+from dotenv import load_dotenv
+import uuid
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Pydantic models (unchanged)
-
+load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(title="POLARIS SCHEDULER")
 SCHEDULER_INTERVAL = 300
 
-# Initialize Firestore
-db = FirestoreDB("db/creds.json")
-
 # Load data from Firestore
-gpu_models, cpu_models, nodes = load_data_from_db(db.db)
+gpu_models, cpu_models, nodes , nodes_dict = load_data_from_db(db)
 gpu_model_list, cpu_model_list = flatten_models(gpu_models, cpu_models)
 # Lock for file operations (kept for potential future use)
 file_lock = threading.Lock()
@@ -67,10 +69,126 @@ async def get_metrics_data(db, installation_ids: List[str]) -> Dict[str, Dict]:
     """
     metrics_data = {}
     for installation_id in installation_ids:
-        doc = db.db.collection("metrics").document(installation_id).get()
+        doc = db.collection("metrics").document(installation_id).get()
         if doc.exists:
             metrics_data[installation_id] = doc.to_dict().get("metrics", {})
     return metrics_data
+
+async def deploy_model_background(
+    assignments: List[dict],
+    nodes_list: List[dict],
+    model: dict,
+    model_type: str,
+    ngrok_token: str,
+    db: Any,
+    nodes: Dict[str, Any],
+    task_id: str
+):
+    """
+    Background task to handle model deployment and database updates.
+    """
+    deployment_results = []
+    try:
+        for assignment in assignments:
+            # Find the node for the assignment
+            node = next((n for n in nodes_list if n["node_id"] == assignment["node_id"]), None)
+            if not node:
+                logger.error(f"Task {task_id}: No node found for node_id {assignment['node_id']}")
+                deployment_results.append(
+                    SingleModelResponse(
+                        node_id=assignment["node_id"],
+                        model=assignment["model"],
+                        hot=assignment["hot"],
+                        deployment_status="failed",
+                        installations=None,
+                        error=f"No node found for node_id {assignment['node_id']}"
+                    )
+                )
+                continue
+
+            try:
+                # Deploy model (replace mock with actual deployment when ready)
+                deployment_result = deploy_model(node, model, model_type.lower() == "gpu", ngrok_token)
+                is_success = deployment_result.startswith("Successfully deployed")
+                response_data = SingleModelResponse(
+                    node_id=assignment["node_id"],
+                    model=assignment["model"],
+                    hot=assignment["hot"],
+                    deployment_status="success" if is_success else "failed",
+                    installations=None
+                )
+
+                if is_success:
+                    # Update node and assignment in database
+                    try:
+                        update_success = update_node_and_assignment(
+                            node_id=assignment["node_id"],
+                            model_name=model["name"],
+                            model_type=model_type,
+                            hot=True,
+                            db=db
+                        )
+                        if update_success:
+                            if assignment["node_id"] in nodes:
+                                nodes[assignment["node_id"]]["hot"] = True
+                            logger.info(f"Task {task_id}: Successfully updated node {assignment['node_id']} hot status and assignment")
+                        else:
+                            logger.error(f"Task {task_id}: Database update failed for node {assignment['node_id']}")
+                            response_data.deployment_status = "failed"
+                            response_data.error = "Database update failed"
+                    except Exception as db_error:
+                        logger.error(f"Task {task_id}: Database update failed for node {assignment['node_id']}: {str(db_error)}")
+                        response_data.deployment_status = "failed"
+                        response_data.error = str(db_error)
+                else:
+                    response_data.error = "Deployment failed"
+
+                deployment_results.append(response_data)
+            except Exception as deploy_error:
+                logger.error(f"Task {task_id}: Deployment failed for node {assignment['node_id']}: {str(deploy_error)}")
+                deployment_results.append(
+                    SingleModelResponse(
+                        node_id=assignment["node_id"],
+                        model=assignment["model"],
+                        hot=assignment["hot"],
+                        deployment_status="failed",
+                        installations=None,
+                        error=str(deploy_error)
+                    )
+                )
+
+        logger.info(f"Task {task_id}: Background deployment results at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())}: {[r.dict() for r in deployment_results]}")
+        # Store results in database for status polling
+        try:
+            db.collection("deployments").document(task_id).set({
+                "results": [r.dict() for r in deployment_results],
+                "status": "completed",
+                "timestamp": time.time()
+            })
+        except Exception as db_error:
+            logger.error(f"Task {task_id}: Failed to store deployment results: {str(db_error)}")
+    except Exception as e:
+        logger.error(f"Task {task_id}: Unexpected error in background deployment: {str(e)}", exc_info=True)
+        deployment_results.append(
+            SingleModelResponse(
+                node_id="unknown",
+                model=model["name"],
+                hot=False,
+                deployment_status="failed",
+                installations=None,
+                error=str(e)
+            )
+        )
+        # Store error in database
+        try:
+            db.collection("deployments").document(task_id).set({
+                "results": [r.dict() for r in deployment_results],
+                "status": "failed",
+                "timestamp": time.time()
+            })
+        except Exception as db_error:
+            logger.error(f"Task {task_id}: Failed to store error results: {str(db_error)}")
+    return deployment_results
 
 @app.on_event("startup")
 async def startup_event():
@@ -81,7 +199,7 @@ async def startup_event():
 async def get_installations(installation_id: Optional[str] = None):
     try:
         # Fetch installations from Firestore
-        installations_ref = db.db.collection("installations")
+        installations_ref = db.collection("installations")
         if installation_id:
             doc = installations_ref.document(installation_id).get()
             if not doc.exists:
@@ -144,13 +262,8 @@ async def get_installations(installation_id: Optional[str] = None):
 @app.get("/model-installations/{model_id}", response_model=ModelInstallationsResponse)
 async def get_model_installations_metrics(model_id: str):
     try:
-        gpu_doc = db.db.collection("gpu_models").where("model_id", "==", model_id).get()
-        cpu_doc = db.db.collection("cpu_models").where("model_id", "==", model_id).get()
-        if not gpu_doc and not cpu_doc:
-            raise HTTPException(status_code=404, detail=f"Model ID {model_id} not found")
-
         # Fetch running installations for the model_id
-        installations = db.db.collection("installations").where("model_id", "==", model_id).where("status", "==", "running").stream()
+        installations = db.collection("installations").where("model_id", "==", model_id).where("status", "==", "running").stream()
         installation_metrics = []
         total_chat_completions_hits = 0
         total_health_hits = 0
@@ -166,7 +279,7 @@ async def get_model_installations_metrics(model_id: str):
                 continue
 
             # Fetch metrics for this installation
-            metrics_doc = db.db.collection("metrics").document(installation_id).get()
+            metrics_doc = db.collection("metrics").document(installation_id).get()
             metrics_data = metrics_doc.to_dict() if metrics_doc.exists else {}
             metrics = metrics_data.get("metrics", {})
 
@@ -247,7 +360,7 @@ async def get_model_installations_metrics(model_id: str):
 async def get_installation_status_summary():
     try:
         # Query all installations
-        installations = db.db.collection("installations").stream()
+        installations = db.collection("installations").stream()
         total_installations = 0
         total_running_installations = 0
         total_stopped_installations = 0
@@ -277,19 +390,19 @@ async def get_installation_status_summary():
 async def add_high_demand_model(request: HighDemandModelRequest):
     try:
         # Validate model exists in gpu_models or cpu_models
-        gpu_doc = db.db.collection("gpu_models").document(request.model_name).get()
-        cpu_doc = db.db.collection("cpu_models").document(request.model_name).get()
+        gpu_doc = db.collection("gpu_models").document(request.model_name).get()
+        cpu_doc = db.collection("cpu_models").document(request.model_name).get()
         if not gpu_doc.exists and not cpu_doc.exists:
             raise HTTPException(status_code=404, detail=f"Model {request.model_name} not found in GPU or CPU models")
 
         # Get current high-demand models
-        doc = db.db.collection("high_demand_models").document("config").get()
+        doc = db.collection("high_demand_models").document("config").get()
         current_models = doc.to_dict().get("models", []) if doc.exists else []
 
         # Add model if not already present
         if request.model_name not in current_models:
             current_models.append(request.model_name)
-            update_high_demand_models(db.db, current_models)
+            update_high_demand_models(db, current_models)
         
         return {"model_name": request.model_name}
     except Exception as e:
@@ -299,7 +412,7 @@ async def add_high_demand_model(request: HighDemandModelRequest):
 async def delete_high_demand_model(model_name: str):
     try:
         # Get current high-demand models
-        doc = db.db.collection("high_demand_models").document("config").get()
+        doc = db.collection("high_demand_models").document("config").get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail="No high-demand models found")
 
@@ -309,7 +422,7 @@ async def delete_high_demand_model(model_name: str):
 
         # Remove model
         current_models.remove(model_name)
-        update_high_demand_models(db.db, current_models)
+        update_high_demand_models(db, current_models)
 
         return {"message": f"Model {model_name} removed from high-demand models"}
     except Exception as e:
@@ -318,7 +431,7 @@ async def delete_high_demand_model(model_name: str):
 @app.get("/high-demand-models", response_model=List[str])
 async def get_high_demand_models():
     try:
-        doc = db.db.collection("high_demand_models").document("config").get()
+        doc = db.collection("high_demand_models").document("config").get()
         if not doc.exists:
             return []
         return doc.to_dict().get("models", [])
@@ -336,12 +449,12 @@ async def add_gpu_model(model: Model):
             raise HTTPException(status_code=400, detail=f"Invalid model type. Must be one of {valid_types}")
 
         # Check if model exists
-        doc = db.db.collection("gpu_models").document(model.name).get()
+        doc = db.collection("gpu_models").document(model.name).get()
         if doc.exists:
             raise HTTPException(status_code=400, detail=f"Model {model.name} already exists")
 
         # Save to Firestore
-        db.db.collection("gpu_models").document(model.name).set(model.dict(exclude_none=True))
+        db.collection("gpu_models").document(model.name).set(model.dict(exclude_none=True))
 
         # Update global data
         global gpu_model_list, gpu_models
@@ -356,7 +469,7 @@ async def add_gpu_model(model: Model):
 async def get_gpu_models(model_name: Optional[str] = None):
     try:
         # Fetch all GPU models from Firestore
-        gpu_models_ref = db.db.collection("gpu_models").stream()
+        gpu_models_ref = db.collection("gpu_models").stream()
         models = [doc.to_dict() for doc in gpu_models_ref]
         logger.info(f"Fetched {len(models)} GPU models from Firestore")
 
@@ -368,7 +481,7 @@ async def get_gpu_models(model_name: Optional[str] = None):
 
         # Fetch installations data for all model IDs
         model_ids = [m["model_id"] for m in models]
-        installations_data = await get_installations_data(db.db, model_ids)
+        installations_data = await get_installations_data(db, model_ids)
         logger.info(f"Fetched installations data for {len(model_ids)} model IDs: {installations_data}")
 
         # Extract installation IDs for metrics lookup
@@ -455,11 +568,11 @@ async def update_gpu_model(model_name: str, model: Model):
         if model.type not in valid_types:
             raise HTTPException(status_code=400, detail=f"Invalid model type. Must be one of {valid_types}")
 
-        doc = db.db.collection("gpu_models").document(model_name).get()
+        doc = db.collection("gpu_models").document(model_name).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
 
-        db.db.collection("gpu_models").document(model_name).set(model.dict(exclude_none=True))
+        db.collection("gpu_models").document(model_name).set(model.dict(exclude_none=True))
 
         global gpu_model_list, gpu_models
         for i, m in enumerate(gpu_models["multimodal_models"]["other_models"]):
@@ -475,11 +588,11 @@ async def update_gpu_model(model_name: str, model: Model):
 @app.delete("/gpu-model/{model_name}")
 async def delete_gpu_model(model_name: str):
     try:
-        doc = db.db.collection("gpu_models").document(model_name).get()
+        doc = db.collection("gpu_models").document(model_name).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
 
-        db.db.collection("gpu_models").document(model_name).delete()
+        db.collection("gpu_models").document(model_name).delete()
 
         global gpu_model_list, gpu_models
         gpu_models["multimodal_models"]["other_models"] = [
@@ -502,11 +615,11 @@ async def add_cpu_model(model: Model):
         if not model.quantization:
             raise HTTPException(status_code=400, detail="Quantization list is required for CPU models")
 
-        doc = db.db.collection("cpu_models").document(model.name).get()
+        doc = db.collection("cpu_models").document(model.name).get()
         if doc.exists:
             raise HTTPException(status_code=400, detail=f"Model {model.name} already exists")
 
-        db.db.collection("cpu_models").document(model.name).set(model.dict())
+        db.collection("cpu_models").document(model.name).set(model.dict())
 
         global cpu_model_list, cpu_models
         if model.type in ["coding", "math", "multilingual"]:
@@ -526,7 +639,7 @@ async def add_cpu_model(model: Model):
 async def get_cpu_models(model_name: Optional[str] = None):
     try:
         # Fetch all CPU models from Firestore
-        cpu_models_ref = db.db.collection("cpu_models").stream()
+        cpu_models_ref = db.collection("cpu_models").stream()
         models = [doc.to_dict() for doc in cpu_models_ref]
         logger.info(f"Fetched {len(models)} CPU models from Firestore")
 
@@ -538,7 +651,7 @@ async def get_cpu_models(model_name: Optional[str] = None):
 
         # Fetch installations data for all model IDs
         model_ids = [m["model_id"] for m in models]
-        installations_data = await get_installations_data(db.db, model_ids)
+        installations_data = await get_installations_data(db, model_ids)
         logger.info(f"Fetched installations data for {len(model_ids)} model IDs")
 
         # Extract installation IDs for metrics lookup
@@ -621,11 +734,11 @@ async def update_cpu_model(model_name: str, model: Model):
         if not model.quantization:
             raise HTTPException(status_code=400, detail="Quantization list is required for CPU models")
 
-        doc = db.db.collection("cpu_models").document(model_name).get()
+        doc = db.collection("cpu_models").document(model_name).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
 
-        db.db.collection("cpu_models").document(model_name).set(model.dict())
+        db.collection("cpu_models").document(model_name).set(model.dict())
 
         global cpu_model_list, cpu_models
         for section in ["text_models", "specialized_models", "lightweight_models"]:
@@ -643,11 +756,11 @@ async def update_cpu_model(model_name: str, model: Model):
 @app.delete("/cpu-model/{model_name}")
 async def delete_cpu_model(model_name: str):
     try:
-        doc = db.db.collection("cpu_models").document(model_name).get()
+        doc = db.collection("cpu_models").document(model_name).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
 
-        db.db.collection("cpu_models").document(model_name).delete()
+        db.collection("cpu_models").document(model_name).delete()
 
         global cpu_model_list, cpu_models
         for section in ["text_models", "specialized_models", "lightweight_models"]:
@@ -666,11 +779,11 @@ async def delete_cpu_model(model_name: str):
 async def add_node(node: Node, background_tasks: BackgroundTasks):
     try:
         node_id = node.compute_resources[0]["id"]
-        doc = db.db.collection("nodes").document(node_id).get()
+        doc = db.collection("nodes").document(node_id).get()
         if doc.exists:
             raise HTTPException(status_code=400, detail=f"Node {node_id} already exists")
 
-        db.db.collection("nodes").document(node_id).set(node.dict())
+        db.collection("nodes").document(node_id).set(node.dict())
 
         global nodes
         nodes[node_id] = node.dict()
@@ -687,7 +800,7 @@ async def get_nodes(node_id: Optional[str] = None):
             if not doc.exists:
                 raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
             return [Node(**doc.to_dict())]
-        nodes_list = [Node(**doc.to_dict()) for doc in db.db.collection("nodes").stream()]
+        nodes_list = [Node(**doc.to_dict()) for doc in db.collection("nodes").stream()]
         return nodes_list
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving nodes: {str(e)}")
@@ -695,11 +808,11 @@ async def get_nodes(node_id: Optional[str] = None):
 @app.put("/node/{node_id}", response_model=Node)
 async def update_node(node_id: str, node: Node, background_tasks: BackgroundTasks):
     try:
-        doc = db.db.collection("nodes").document(node_id).get()
+        doc = db.collection("nodes").document(node_id).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
 
-        db.db.collection("nodes").document(node_id).set(node.dict())
+        db.collection("nodes").document(node_id).set(node.dict())
 
         global nodes
         nodes[node_id] = node.dict()
@@ -711,11 +824,11 @@ async def update_node(node_id: str, node: Node, background_tasks: BackgroundTask
 @app.delete("/node/{node_id}")
 async def delete_node(node_id: str, background_tasks: BackgroundTasks):
     try:
-        doc = db.db.collection("nodes").document(node_id).get()
+        doc = db.collection("nodes").document(node_id).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
 
-        db.db.collection("nodes").document(node_id).delete()
+        db.collection("nodes").document(node_id).delete()
 
         global nodes
         if node_id in nodes:
@@ -729,10 +842,10 @@ async def delete_node(node_id: str, background_tasks: BackgroundTasks):
 @app.get("/auto-match", response_model=AssignmentResponse)
 async def auto_match_models(background_tasks: BackgroundTasks):
     try:
-        gpu_nodes = get_available_nodes(nodes, "GPU", [], db.db)
-        cpu_nodes = get_available_nodes(nodes, "CPU", [], db.db)
-        gpu_assignments = assign_models_to_nodes(gpu_nodes, gpu_model_list, max_models=3, usage_data=[], db=db.db)
-        cpu_assignments = assign_models_to_nodes(cpu_nodes, cpu_model_list, max_models=2, usage_data=[], db=db.db)
+        gpu_nodes = get_available_nodes(nodes, "GPU", [], db)
+        cpu_nodes = get_available_nodes(nodes, "CPU", [], db)
+        gpu_assignments = assign_models_to_nodes(gpu_nodes, gpu_model_list, max_models=3, usage_data=[], db=db)
+        cpu_assignments = assign_models_to_nodes(cpu_nodes, cpu_model_list, max_models=2, usage_data=[], db=db)
 
         for assignment in gpu_assignments + cpu_assignments:
             node = next(n for n in nodes.values() if n["compute_resources"][0]["id"] == assignment.node_id)
@@ -796,15 +909,15 @@ async def update_assignment(node_id: str, assignment: Assignment, background_tas
             if not any(model["name"] == m["model"] for model in model_list):
                 raise HTTPException(status_code=400, detail=f"Model {m['model']} not found in {assignment.type} models")
 
-        doc = db.db.collection("assignments").document(node_id).get()
+        doc = db.collection("assignments").document(node_id).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Assignment for node {node_id} not found")
 
-        db.db.collection("assignments").document(node_id).set({
+        db.collection("assignments").document(node_id).set({
             "node_id": node_id,
             "type": assignment.type,
             "models": assignment.models,
-            "timestamp": db.db.server_timestamp()
+            "timestamp": db.server_timestamp()
         }, merge=True)
 
         node = next((n for n in nodes.values() if n["compute_resources"][0]["id"] == node_id), None)
@@ -821,41 +934,148 @@ async def update_assignment(node_id: str, assignment: Assignment, background_tas
 @app.delete("/assignment/{node_id}")
 async def delete_assignment(node_id: str):
     try:
-        doc = db.db.collection("assignments").document(node_id).get()
+        doc = db.collection("assignments").document(node_id).get()
         if not doc.exists:
             raise HTTPException(status_code=404, detail=f"Assignment for node {node_id} not found")
 
-        db.db.collection("assignments").document(node_id).delete()
+        db.collection("assignments").document(node_id).delete()
         return {"message": f"Assignment for node {node_id} deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting assignment: {str(e)}")
 
-@app.post("/deploy-model", response_model=SingleModelResponse)
+@app.post("/deploy-model")
 async def match_single_model(request: SingleModelRequest, background_tasks: BackgroundTasks):
     try:
+        task_id = str(uuid.uuid4())
         model_list = gpu_model_list if request.model_type.lower() == "gpu" else cpu_model_list
         model = next((m for m in model_list if m["name"] == request.model_name), None)
         if not model:
             raise HTTPException(status_code=404, detail=f"Model {request.model_name} not found")
         resource_type = "GPU" if request.model_type.lower() == "gpu" else "CPU"
-        nodes_list = get_available_nodes(nodes, resource_type, [], db.db)
-        assignment = find_best_node_for_model(nodes_list, model, is_gpu=request.model_type.lower() == "gpu", hot=request.hot, db=db.db)
-        if not assignment:
-            raise HTTPException(status_code=404, detail=f"No suitable node found for model {request.model_name}")
-
-        node = next(n for n in nodes.values() if n["compute_resources"][0]["id"] == assignment["node_id"])
-        # background_tasks.add_task(deploy_model, node, model, request.hot)
-
-        return SingleModelResponse(
-            node_id=assignment["node_id"],
-            model=assignment["model"],
-            hot=request.hot
+        nodes_list = get_available_nodes(nodes_dict, resource_type)
+        assignments = find_best_node_for_model(nodes_list, model, is_gpu=request.model_type.lower() == "gpu", hot=request.hot, db=db)
+        if not assignments:
+            raise HTTPException(status_code=404, detail=f"No suitable nodes found for model {request.model_name}")
+        ngrok_token = os.environ.get("NGROK_AUTH_TOKEN") 
+        if not ngrok_token:
+            raise HTTPException(status_code=500, detail="NGROK_AUTH_TOKEN not set in environment")
+        background_tasks.add_task(
+            deploy_model_background,
+            assignments,
+            nodes_list,
+            model,
+            request.model_type,
+            ngrok_token,
+            db,
+            nodes,
+            task_id
         )
+
+        # Return immediate response to frontend
+        response = {
+            "task_id": task_id,
+            "status": "queued",
+            "message": f"Deployment of model {request.model_name} has been queued",
+            "model_name": request.model_name,
+            "model_type": request.model_type,
+            "hot": True
+        }
+        logger.info(f"Queued deployment task {task_id} for model {request.model_name}")
+        return response
+
     except HTTPException as e:
         raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error matching model: {str(e)}")
+        logger.error(f"Unexpected error in endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error queuing deployment: {str(e)}")
 
+@app.get("/deploy-status/{task_id}", response_model=Dict[str, Any])
+async def get_deployment_status(task_id: str):
+    try:
+        # Query database for task status
+        doc = db.collection("deployments").document(task_id).get()
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        return doc.to_dict()
+    except Exception as e:
+        logger.error(f"Error retrieving status for task {task_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving status: {str(e)}")
+    
+@app.post("/chats", response_model=ChatResponse)
+async def chats(request: ChatRequest):
+    try:
+        # Query installations collection for matching model_id
+        installations_query = db.collection("installations").where("model_id", "==", request.model_id).where("status", "==", "running").stream()
+        installations = []
+        
+        for doc in installations_query:
+            install_data = doc.to_dict()
+            installations.append({
+                "installation_id": install_data.get("installation_id", ""),
+                "public_url": install_data.get("public_url", ""),
+                "model_id": install_data.get("model_id", "")
+            })
+
+        if not installations:
+            raise HTTPException(status_code=404, detail=f"No running installations found for model_id {request.model_id}")
+
+        # Check metrics for each installation
+        best_installation = None
+        lowest_hits = float("inf")
+        
+        for install in installations:
+            installation_id = install["installation_id"]
+            
+            # Query metrics collection for /v1/chat/completions endpoint
+            metrics_doc = db.collection("metrics").document(installation_id).get()
+            if not metrics_doc.exists:
+                logger.warning(f"No metrics found for installation {installation_id}")
+                continue
+
+            metrics_data = metrics_doc.to_dict()
+            chat_completions = metrics_data.get("/v1/chat/completions", {})
+            
+            if not chat_completions:
+                logger.info(f"No /v1/chat/completions metrics for installation {installation_id}, considering it")
+                hits = 0  # Assume 0 hits if no metrics
+            else:
+                hits = chat_completions.get("hits", 0)
+
+            # Select installation with hits <= 500 and lowest hits
+            if hits <= 500 and hits < lowest_hits:
+                best_installation = install
+                lowest_hits = hits
+
+        if not best_installation:
+            # Fallback: Choose installation with lowest hits if all exceed 500
+            for install in installations:
+                metrics_doc = db.collection("metrics").document(install["installation_id"]).get()
+                hits = 0
+                if metrics_doc.exists:
+                    metrics_data = metrics_doc.to_dict()
+                    chat_completions = metrics_data.get("/v1/chat/completions", {})
+                    hits = chat_completions.get("hits", 0)
+                
+                if hits < lowest_hits:
+                    best_installation = install
+                    lowest_hits = hits
+
+        if not best_installation:
+            raise HTTPException(status_code=503, detail="No suitable installations available")
+
+        # Return the best installation's public URL
+        return ChatResponse(
+            public_url=best_installation["public_url"],
+            installation_id=best_installation["installation_id"],
+            model_id=best_installation["model_id"],
+            hits=lowest_hits
+        )
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error in chats endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -12,11 +12,6 @@ class NodeAssignment(BaseModel):
 
 
 
-class SingleModelResponse(BaseModel):
-    node_id: str
-    model: str
-    hot: bool
-
 class ModelUsage(BaseModel):
     model_name: str
     request_count: int
@@ -33,6 +28,7 @@ class Node(BaseModel):
     compute_resources: List[Dict]  # Note: Should be List[ComputeResource] for consistency
     last_checked: Optional[datetime] = None  # Changed to datetime
     uptime_seconds: Optional[float] = None
+    hot: Optional[bool] = False
 
 class Assignment(BaseModel):
     node_id: str
@@ -97,6 +93,7 @@ class Model(BaseModel):
     model_id: str
     parameters: str
     type: str
+    model_path: str
     requires: str
     description: str
     quantization: Optional[List[str]] = None
@@ -104,3 +101,20 @@ class Model(BaseModel):
     public_urls: Optional[List[str]] = []  # List of public URLs
     status: Optional[str] = "cold"
     installation_metrics: Optional[List[InstallationMetrics]] = None
+
+class SingleModelResponse(BaseModel):
+    node_id: str
+    model: str
+    hot: bool
+    deployment_status: str  # New field: "success" or "failed"
+    installations: Optional[List[InstallationMetrics]] = None
+
+
+class ChatRequest(BaseModel):
+    model_id: str
+
+class ChatResponse(BaseModel):
+    public_url: str
+    installation_id: str
+    model_id: str
+    hits: int
